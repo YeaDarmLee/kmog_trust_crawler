@@ -1,10 +1,7 @@
-# mh_disposal_list_crawl.py
-# 무궁화신탁 공매/매각 게시판 전체 크롤링 → 단일 CSV 누적 저장
-# - 249(과거) → 1(최신) 역순
-# - 기본 필드: 신탁사명, 제목, 게시일, 원문링크
-# - 추가 필드: 주소, 건물명, 도시명, use(오피스텔 등), is_duplicate(제목 중복체크)
-# - Resume + 중복 방지(URL 기준), 제목 중복은 표기만
-# - SSL 문제 대응: HTTP 우선 + www/HTTPS 폴백
+# mh_disposal_list_crawl_enriched.py
+# 무궁화신탁 공매/매각 게시판 전체 크롤링 → 단일 CSV 누적 저장 (+주소/도시/건물/매각내용)
+# 원본 기반 확장: 제목에서 파생 필드를 추출하여 CSV에 함께 기록
+# Resume/중복 방지/HTTP→HTTPS 폴백 로직 유지
 
 import os, re, time, csv, logging, json
 from datetime import datetime
@@ -13,20 +10,13 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 from bs4 import BeautifulSoup
 
-# ====== 제목 파서 (주소/건물명/도시명/용도 추출) ======
-# address_test.py 를 같은 폴더에 두고 import
-try:
-  from address_test import parse_line  # returns List[Dict]
-except Exception:
-  # 안전장치: 배포 경로 이슈 시 상대 경로 import 시도
-  import importlib.util
-  SPEC = importlib.util.spec_from_file_location("address_test", os.path.join(os.path.dirname(__file__), "address_test.py"))
-  MOD = importlib.util.module_from_spec(SPEC) if SPEC else None
-  if SPEC and MOD:
-    SPEC.loader.exec_module(MOD)
-    parse_line = MOD.parse_line
-  else:
-    raise
+# ── 여기 추가: 주소/도시/건물/매각내용 추출 모듈 ──
+from address_only_regex import (
+  extract_address,
+  extract_province_sgg,
+  extract_building_name,
+  extract_sale_content,
+)
 
 # 접속 베이스 후보 (SSL 회피를 위해 http 우선)
 BASE_CANDIDATES = [
@@ -41,15 +31,16 @@ DETAIL_HREF_RE = re.compile(r"^/auction/disposal/\d+/show\.do(\?.*)?$")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 # === 설정 ===
-# START_PAGE = 249   # 과거
-START_PAGE = 10   # 과거
+START_PAGE = 249   # 과거
 END_PAGE   = 1     # 최신
 STEP       = -1    # 249 → 1
 DELAY_SEC  = 1.0   # politeness
 
 RESUME = True
 STATE_FILE = "output/.mghat_state.json"
-OUTPUT_CSV = "output/mghat_list_all.csv"
+
+# 기존 CSV와 헤더가 달라 충돌을 피하기 위해 v2로 저장
+OUTPUT_CSV = "output/mghat_list_all_v2.csv"
 
 def setup_logging():
   os.makedirs("logs", exist_ok=True)
@@ -70,6 +61,7 @@ def make_session() -> requests.Session:
                   "Chrome/127.0.0.0 Safari/537.36",
     "Accept-Language": "ko,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html",
     "Connection": "keep-alive",
   })
   retries = Retry(
@@ -115,14 +107,14 @@ def fetch_list_page(session: requests.Session, page: int) -> Tuple[Optional[str]
   return None, None
 
 def _find_first_date_in_row(row) -> str:
-  # 1) td.txt-gray 중 YYYY-MM-DD 매칭되는 첫 번째 사용
+  # 1) td.txt-gray 중 YYYY-MM-DD
   txt_cells = row.select("td.txt-gray")
   for td in txt_cells:
     t = td.get_text(" ", strip=True)
     m = DATE_RE.search(t)
     if m:
       return m.group(0)
-  # 2) 모바일용 div.m-date-view > span:first
+  # 2) 모바일용 보강
   mview = row.select_one(".m-date-view span")
   if mview:
     m = DATE_RE.search(mview.get_text(" ", strip=True))
@@ -130,31 +122,33 @@ def _find_first_date_in_row(row) -> str:
       return m.group(0)
   return ""
 
-def _norm_title(s: str) -> str:
-  # 제목 중복 체크용 정규화: 공백/특수문자 축약 + 소문자
-  s = re.sub(r"\s+", " ", s).strip().lower()
-  s = re.sub(r"[^\w가-힣]+", "", s)
-  return s
-
-def _parse_title_fields(title: str) -> Tuple[str, str, str, str]:
+def _enrich_row(it: Dict[str, str]) -> Dict[str, str]:
   """
-  제목을 파서에 넣어 address, building, city, use 추출
-  - parse_line()은 List[Dict]를 반환. 첫 결과를 우선 사용.
-  - 실패 시 빈 문자열 반환.
+  title로부터 address/city/building/sale_content 파생 필드를 채워 넣는다.
+  비정상 입력에 대비해 예외는 빈값 처리로 흡수.
   """
+  title = it.get("title", "") or ""
   try:
-    rows = parse_line(title) or []
-    if not rows:
-      return "", "", "", ""
-    r0 = rows[0] or {}
-    address = (r0.get("address") or "").strip()
-    building = (r0.get("building") or "").strip()
-    city = (r0.get("city") or "").strip()
-    use = (r0.get("use") or "").strip()
-    return address, building, city, use
-  except Exception as e:
-    logging.warning("제목 파싱 실패: %s | err=%s", title, e)
-    return "", "", "", ""
+    addr = extract_address(title) or ""
+  except Exception:
+    addr = ""
+  try:
+    city = extract_province_sgg(title, use_address_fallback=True) or ""
+  except Exception:
+    city = ""
+  try:
+    building = extract_building_name(title) or ""
+  except Exception:
+    building = ""
+  try:
+    sale = extract_sale_content(title) or ""
+  except Exception:
+    sale = ""
+  it["address"] = addr
+  it["city"] = city
+  it["building"] = building
+  it["sale_content"] = sale
+  return it
 
 def parse_list_items(html: str, base: str) -> List[Dict[str, str]]:
   soup = BeautifulSoup(html, "lxml")
@@ -170,17 +164,7 @@ def parse_list_items(html: str, base: str) -> List[Dict[str, str]]:
       title = a.get_text(strip=True)
       date_str = _find_first_date_in_row(row) if row else ""
       url = _full_url(base, a.get("href", "").strip())
-      address, building, city, use = _parse_title_fields(title)
-      items.append({
-        "trust_name": "무궁화신탁",
-        "title": title,
-        "post_date": date_str,
-        "url": url,
-        "address": address,
-        "building": building,
-        "city": city,
-        "use": use,
-      })
+      items.append(_enrich_row({"trust_name": "무궁화신탁", "title": title, "post_date": date_str, "url": url}))
     return items
 
   for row in rows:
@@ -193,26 +177,10 @@ def parse_list_items(html: str, base: str) -> List[Dict[str, str]]:
     title = a.get_text(strip=True)
     date_str = _find_first_date_in_row(row)
     url = _full_url(base, href)
-    address, building, city, use = _parse_title_fields(title)
-    items.append({
-      "trust_name": "무궁화신탁",
-      "title": title,
-      "post_date": date_str,
-      "url": url,
-      "address": address,
-      "building": building,
-      "city": city,
-      "use": use,
-    })
+    items.append(_enrich_row({"trust_name": "무궁화신탁", "title": title, "post_date": date_str, "url": url}))
   return items
 
-# ---------- 단일 CSV 누적 저장 + 상태 관리 ----------
-FIELDNAMES = [
-  "trust_name", "title", "post_date", "url",
-  "address", "building", "city", "use",
-  "is_duplicate"  # 제목 중복 여부(Y/N)
-]
-
+# ---------- 단일 CSV 누적 저장 유틸 ----------
 def _csv_exists(path: str) -> bool:
   return os.path.exists(path) and os.path.getsize(path) > 0
 
@@ -220,7 +188,9 @@ def _open_csv_writer(path: str):
   os.makedirs(os.path.dirname(path), exist_ok=True)
   file_exists = _csv_exists(path)
   f = open(path, "a", newline="", encoding="utf-8-sig")
-  w = csv.DictWriter(f, fieldnames=FIELDNAMES)
+  # 헤더 확장: 신필드 4개 포함
+  fieldnames = ["trust_name", "title", "post_date", "url", "address", "city", "building", "sale_content"]
+  w = csv.DictWriter(f, fieldnames=fieldnames)
   if not file_exists:
     w.writeheader()
   return f, w
@@ -232,7 +202,7 @@ def _load_state() -> Dict:
         return json.load(f)
   except Exception:
     pass
-  return {"last_done_page": None, "seen_urls": [], "seen_titles": []}
+  return {"last_done_page": None, "seen_urls": []}
 
 def _save_state(state: Dict):
   try:
@@ -249,7 +219,6 @@ def main():
 
   state = _load_state()
   seen_urls = set(state.get("seen_urls") or [])
-  seen_titles = set(state.get("seen_titles") or [])
   last_done = state.get("last_done_page")
 
   start_page = START_PAGE
@@ -268,43 +237,22 @@ def main():
         time.sleep(DELAY_SEC)
         continue
 
-      logging.info("  사용 base: %s", base_used)
-
       items = parse_list_items(html, base_used)
 
-      # 상위 3개 샘플 로그
-      for i, it in enumerate(items[:3], start=1):
-        logging.info("  #%d  [%s] %s | %s", i, it.get("post_date") or "-", it["title"], it["url"])
-
-      # 쓰기: URL 완전중복은 스킵, 제목 중복은 표기만
+      # 중복 방지 후 CSV 누적 저장
       new_count = 0
       for it in items:
         url = it["url"]
-        norm_title = _norm_title(it["title"])
-        is_dup = "Y" if norm_title in seen_titles else "N"
-
         if url in seen_urls:
-          # 완전 동일 URL은 저장 스킵(이미 저장됨)
           continue
-
-        row = {
-          **it,
-          "is_duplicate": is_dup
-        }
-        writer.writerow(row)
-        new_count += 1
-
-        # 상태 갱신
+        writer.writerow(it)
         seen_urls.add(url)
-        seen_titles.add(norm_title)
-
-      logging.info("[LIST] page=%s 저장 rows(new)=%d / 누적 unique_urls=%d / unique_titles=%d",
-                   page, new_count, len(seen_urls), len(seen_titles))
+        new_count += 1
+      logging.info("[LIST] page=%s 저장 rows(new)=%d / 누적 unique=%d", page, new_count, len(seen_urls))
 
       # 상태 저장(체크포인트)
       state["last_done_page"] = page
       state["seen_urls"] = list(seen_urls)
-      state["seen_titles"] = list(seen_titles)
       _save_state(state)
 
       time.sleep(DELAY_SEC)

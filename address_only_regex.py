@@ -136,42 +136,51 @@ _BUILDING_CANDIDATE = re.compile(
   rf"({_BUILDING_CORE}(?:{_BUILDING_SUFFIX})?)"
 )
 
+_EXCLUDE_BUILDING = re.compile(
+  r"""^
+      (?:외\s*\d+\s*)?             # '외1', '외 3' 등 접두
+      (?:\d+\s*)?(?:개\s*)?        # '32개' 등
+      (?:필지|호|호실|세대)\s*$     # 단위
+  """, re.X
+)
+
 def extract_building_name(title: str) -> str:
   """
   주소/동·층·호/공고 키워드를 제거하고 남는 구간에서
-  가장 그럴듯한 '건물명(동호수 제외)'을 한 개 반환.
+  동호수 제외 '건물명' 1개를 반환.
+  - '3필지', '32개 호실' 등 수량/단위 표현은 건물명에서 제외.
   """
   s = (title or "").strip()
 
-  # 1) 주소를 걷어낸 나머지 텍스트 구하기
+  # 1) 주소 제거 후 남은 텍스트
   addr = extract_address(s)
   tail = s[len(addr):].strip() if addr and s.startswith(addr) else s
 
-  # 2) 괄호/동층호/불용어(공고키워드) 제거
+  # 2) 괄호/동·층·호/공고 키워드 제거
   tail = _BRACKET.sub(" ", tail)
   tail = _UNIT_TOKENS.sub(" ", tail)
-  # 공고 키워드 이후는 잘라낸다(뒤는 매각내용일 확률↑)
   mstop = _BUILDING_STOP.search(tail)
   if mstop:
     tail = tail[:mstop.start()].strip()
 
-  # 3) 쉼표/구분자 분해 후, 빌딩 후보 토큰 스캔
+  # 3) 구분자 분해 → 건물명 후보 스캔
   parts = [p.strip() for p in _SEPARATORS.split(tail) if p.strip()]
   best = ""
+
+  def score(x: str) -> tuple:
+    suf = x.endswith(("타워","팰리스","캐슬","밸리","스퀘어","시티","힐스","아이파크","자이","더힐","프라자","프라임","스카이","에버빌","해링턴타워","해링턴","아파트","오피스텔","빌라","빌리지","몰","스포츠몰"))
+    return (1 if suf else 0, len(x))
+
   for p in parts:
-    # 너무 짧은 일반명사는 제외(2자 이하)
-    cand = []
+    cands = []
     for mm in _BUILDING_CANDIDATE.finditer(p):
       token = mm.group(1).strip("-·").strip()
-      if len(token) >= 3:
-        cand.append(token)
-    # 후보 중 가장 긴 것을 선택(힌트 접미사 포함 시 가산)
-    if cand:
-      cand.sort(key=lambda x: (x.endswith(tuple(
-        ["타워","팰리스","캐슬","밸리","스퀘어","시티","힐스","아이파크","자이","더힐","프라자","프라임","스카이","에버빌","해링턴타워","해링턴","아파트","오피스텔","빌라","빌리지","몰","스포츠몰"]
-      )), len(x)), reverse=True)
-      pick = cand[0]
-      if len(pick) > len(best):
+      # ① 최소 길이 ② 수량/단위 토큰 제외
+      if len(token) >= 3 and not _EXCLUDE_BUILDING.match(token):
+        cands.append(token)
+    if cands:
+      pick = sorted(cands, key=score, reverse=True)[0]
+      if score(pick) > score(best):
         best = pick
 
   return best
@@ -198,36 +207,35 @@ _SALE_RX = re.compile("|".join(f"(?:{p})" for p in _SALE_PATTERNS))
 
 def extract_sale_content(title: str) -> str:
   """
-  4) 매각내용: title 에서 1)주소, 2)시군구(광역/도+시군구),
-  3)건물명을 제거하고 남은 텍스트를 그대로 반환.
-  - 제거는 '처음 등장하는 1회'만 수행해 과제된 순서를 보존
-  - 선행 공백/구두점 정리
+  title에서 1)주소 2)광역/도+시군구 3)건물명을 제거한 '나머지'를 반환.
+  - 선두의 '외', '외1', '외 3' 같은 접두는 추가로 제거.
+  - 공백/구두점 정리.
   """
   s = (title or "").strip()
 
   # 1) 주소 제거
   addr = extract_address(s)
   if addr:
-    # 주소가 선두에 오지 않는 예외도 있어서 첫 1회만 치환
     s = s.replace(addr, "", 1).strip()
 
-  # 2) 시군구(광역/도 + 시군구) 제거
+  # 2) 광역/도 + 시군구 제거
   prov_sgg = extract_province_sgg(title, use_address_fallback=True)
   if prov_sgg:
     s = s.replace(prov_sgg, "", 1).strip()
 
-  # 3) 건물명 제거 (있을 때만)
+  # 3) 건물명 제거
   bld = extract_building_name(title)
   if bld:
     s = s.replace(bld, "", 1).strip()
 
-  # 앞뒤 구두점/불필요 토큰 정리
-  # - 남는 괄호쌍/콤마/슬래시 앞뒤 공백 정규화
-  # - 선두·말미에 붙은 구분자 제거
-  s = re.sub(r"\s+", " ", s)
-  s = re.sub(r"\s*([,\u00B7·/])\s*", r"\1", s)     # 구분자 주변 공백
-  s = re.sub(r"^[,·/]+", "", s)                    # 선두 구분자
-  s = re.sub(r"[,·/]+$", "", s)                    # 말미 구분자
-  s = s.strip()
+  # ── 선행 '외' 접두 정리 ──
+  s = re.sub(r"^외\s*\d+\s*", "", s)  # '외1', '외 3' 등
+  s = re.sub(r"^외\s+", "", s)        # 단독 '외'
 
-  return s
+  # 공백/구두점 정리
+  s = re.sub(r"\s+", " ", s)
+  s = re.sub(r"\s*([,\u00B7·/])\s*", r"\1", s)
+  s = re.sub(r"^[,·/]+", "", s)
+  s = re.sub(r"[,·/]+$", "", s)
+
+  return s.strip()
