@@ -48,7 +48,23 @@ BASE = "http://mghat.com"
 LIST_PATH = "/auction/disposal/list.do"
 TRUST_NAME = "무궁화 신탁"
 
-DATE_RE = re.compile(r"\d{4}[.\-]\d{2}[.\-]\d{2}")
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+def _find_first_date_in_row(row) -> str:
+  txt_cells = row.select("td.txt-gray")
+  for td in txt_cells:
+    t = td.get_text(" ", strip=True)
+    m = DATE_RE.search(t)
+    if m:
+      return m.group(0)
+  mview = row.select_one(".m-date-view span")
+  if mview:
+    m = DATE_RE.search(mview.get_text(" ", strip=True))
+    if m:
+      return m.group(0)
+  return ""
+
+
 DELAY_SEC = 1.0
 
 # 기본: 현재→과거 (페이지 예시로 384 사용)
@@ -285,13 +301,7 @@ def parse_list_page(html: str) -> List[Dict[str, str]]:
       title = a.get_text(" ", strip=True)
 
     # 날짜 탐색: 강인한 추출 (td, span, .date 등)
-    date_el = node.select_one(".date") or node.select_one(".regdate") or node.select_one("td.date") or node.select_one("td:nth-last-child(1)")
-    if date_el:
-      post_date = _normalize_date(date_el.get_text(" ", strip=True))
-    else:
-      # 근처 텍스트에서 날짜 패턴 검색
-      txt = node.get_text(" ", strip=True)
-      post_date = _normalize_date(txt)
+    post_date = _find_first_date_in_row(node)
 
     # 번호 추출 시도 (첫 컬럼 등)
     num_el = node.select_one(".num") or node.select_one(".number") or node.select_one("td:first-child")
