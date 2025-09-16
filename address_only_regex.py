@@ -303,7 +303,8 @@ def extract_city_sgg(title_or_address: str, *, use_address_fallback: bool = True
 # ─────────────────────────────────────────────────────────────
 # 3) 건물명 추출 (행정구역 토큰 제외)
 _BUILDING_STOP = re.compile(
-  r"(?:일괄매각|개별매각|매각\s*공고|매각공고|재공매|재매각|후\s*개별수의계약\s*공고)"
+  r"(?:일괄매각|개별매각|매각\s*공고|매각공고|재공매|재매각|후\s*개별수의계약\s*공고|"
+  r"공매\s*공고|공매공고|입찰\s*공고|입찰공고|\b공고\b)"
 )
 _UNIT_TOKENS = re.compile(
   r"(?:제?[0-9A-Za-z\-]+동|제?[0-9A-Za-z\-]+층|제?[0-9A-Za-z\-]+호|[0-9]+동|[0-9]+층|[0-9]+호)"
@@ -339,6 +340,11 @@ _ADMIN_FULL = re.compile(
   r"울산광역시|울산시|울산|경기도|경기|강원특별자치도|강원도|강원|충청북도|충북|"
   r"충청남도|충남|전북특별자치도|전라북도|전북|전라남도|전남|경상북도|경북|"
   r"경상남도|경남|제주특별자치도|제주도|제주|세종특별자치시|세종시|세종)$"
+)
+
+# 공고/공매류 단어는 건물명 후보에서 제외
+_FORBID_BUILDING = re.compile(
+  r"^(?:공매공고|공매|입찰공고|입찰|매각공고|매각|공고|연기공고|연기)$"
 )
 
 def extract_building_name(title: str) -> str:
@@ -383,8 +389,11 @@ def extract_building_name(title: str) -> str:
         continue
       if _is_admin_token(token):
         continue
+      if _FORBID_BUILDING.match(token):  # ← 이 줄 추가!
+        continue
       if not best or score(token) > score(best):
         best = token
+
   return best
 
 # ─────────────────────────────────────────────────────────────
