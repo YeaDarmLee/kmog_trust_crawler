@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
-# address_only_regex.py (v11)
-# - 제목 앞 태그([공매], [재공매], [3차공매], [공매연기] 등) 무시
+# address_only_regex.py (v12)
+# - [공매]/[재공매]/[3차공매] 등 태그 무시
 # - 세종특별자치시 특수 처리
 # - 광역/도 약칭(서울/부산/인천/경기/충남/전북/제주 등) 대응
-# - '시/군/구 단독 시작' + '광역 없이 시/군/구로 시작' + '광역 + 원시도시 + 동/읍/면' + '광역 + 동/읍/면' 대응
-# - 주소는 행정구역~지번까지 최대 확장(예: '전주시 완산구 고사동 408-3')
-# - 매각내용에서 '외 N개/필지/호실' 선두 정리, 공고 키워드 보존
+# - '시/군/구 단독 시작' + '광역 + 원시도시 + 동/읍/면' + '광역 + 동/읍/면' 대응
+# - 지번 하이픈(ASCII/유니코드) 인식 보강
+# - TOWN_RELAX를 '한글만' 허용(숫자 토큰을 동/리로 오인하지 않도록)
+# - 건물명에서 행정구역 토큰(○○시/군/구/도, 인천광역시 등) 제외
+# - 매각내용에서 태그/주소/건물명 제거 및 '외 N...' → 'N...' 정리
 
 import re
 
 # ─────────────────────────────────────────────────────────────
 # 기본 토큰
-# - 숫자목차 "1. " + 대괄호 태그들 "[공매]" "[재공매]" 등 반복 허용
 PREFIX = r"(?:\d+\.\s*)?(?:\[[^\]]+\]\s*)*"
 
 # 세종 전용 토큰 (광역명)
@@ -42,23 +43,27 @@ REG1_NO_SEJONG = (
 # 전체 광역/도 (세종 포함)
 REG1 = rf"(?:{PROV_SEJONG}|{REG1_NO_SEJONG})"
 
-# 시/군/구 — 뒤에 공백/끝 경계 요구(강구면이 '강구'로 잘리는 문제 방지)
+# 시/군/구 — 뒤에 공백/끝 경계 요구
 CITY_GUN_GU = r"(?:[가-힣]+(?:시|군|구))(?=\s|$)"
 
 # 광역 뒤에 붙는 '원시 도시명'(접미사 없음: 파주/포천/양양/홍성 등)
 RAW_CITY = r"(?:[가-힣]{2,})"
 
-# 읍/면/동/가/리 (일부 데이터에서 '선단/신읍/동백'처럼 접미사 생략되는 경우가 있어 보강 토큰도 추가)
+# 읍/면/동/가/리
 TOWN_STRICT = r"(?:[가-힣0-9]+(?:읍|면|동|가|리))"
-TOWN_RELAX  = r"(?:[가-힣0-9]{2,})"  # 접미사 없는 동/리 형태 허용(선단, 신읍, 동백 등)
+# ⚠ 숫자만(예: '94')이 동/리로 오인되지 않도록 한글만 허용
+TOWN_RELAX  = r"(?:[가-힣]{2,})"
 TOWN = rf"(?:{TOWN_STRICT}|{TOWN_RELAX})"
 
 # 도로명
 ROAD = r"(?:[가-힣0-9]+(?:로|길|대로|번길))"
 
-# 지번/산 (가-660-2 같은 '가-' 접두 하이픈형도 허용)
-LOT = r"(?:산\s*)?(?:[가-힣]-\d+|\d+)(?:-\d+)?(?:\s*(?:일원|번지))?"
-LOT_LIST = rf"{LOT}(?:\s*,\s*(?:[가-힣]-\d+|\d+)(?:-\d+)?)*"
+# 하이픈(ASCII/유니코드)
+HYP = r"[-–—−﹣－]"
+
+# 지번/산 (가-660-2, 94-3 등)
+LOT = rf"(?:산\s*)?(?:[가-힣]{HYP}\d+|\d+)(?:{HYP}\d+)?(?:\s*(?:일원|번지))?"
+LOT_LIST = rf"{LOT}(?:\s*,\s*(?:[가-힣]{HYP}\d+|\d+)(?:{HYP}\d+)?)*"
 
 # 도시계획/구획 명칭 — 지구/구역까지 주소에 포함
 PLAN_DIST = r"(?:[가-힣0-9]+(?:지구|구역))"
@@ -95,7 +100,7 @@ PATTERN = rf"""
   (?:\s*{LOT_LIST})?
 
   |
-  # ◇ 보강2: 광역/도 + '원시 도시명' + (동/읍/면) — 예: '경기 파주 야당동', '충남 홍성 오관리'
+  # ◇ 보강2: 광역/도 + '원시 도시명' + 동/읍/면 (예: '경기 파주 야당동', '충남 홍성 오관리')
   (?P<prov_raw>{REG1_NO_SEJONG})
   \s+ (?P<rawcity>{RAW_CITY})
   (?:\s+{TOWN}){{1,3}}
@@ -104,7 +109,7 @@ PATTERN = rf"""
   (?:\s*{LOT_LIST})?
 
   |
-  # ◇ 보강3: 광역/도 + (동/읍/면) 직결 — 예: '인천 만수동', '제주 한림읍'
+  # ◇ 보강3: 광역/도 + 동/읍/면 직결 (예: '인천 만수동', '제주 한림읍')
   (?P<prov_town>{REG1_NO_SEJONG})
   (?:\s+{TOWN}){{1,3}}
   (?:\s+{PLAN_DIST})?
@@ -116,12 +121,10 @@ PATTERN = rf"""
 RX_ADDR = re.compile(PATTERN, re.X)
 
 def extract_address(title: str) -> str:
-  """
-  제목에서 '행정구역~지번/지구/구역'까지의 '주소만' 추출.
-  """
   m = RX_ADDR.search(title or "")
   if not m:
     return ""
+  # 대괄호 태그 등 PREFIX 제거
   return re.sub(rf"^{PREFIX}", "", m.group("addr")).strip()
 
 # ─────────────────────────────────────────────────────────────
@@ -187,13 +190,6 @@ def _normalize_province(p: str) -> str:
   return _PROV_STD.get(p, p)
 
 def extract_province_sgg(title_or_address: str, *, use_address_fallback: bool = True) -> str:
-  """
-  출력: '광역/도 + 시군구'
-  - 세종은 '세종특별자치시'만 반환
-  - 시/군/구 단독 시작 → 해당 시군구 시퀀스
-  - 광역/도 + 원시도시 + 동/읍/면 → '광역/도 + 원시도시'
-  - 광역/도 + 동/읍/면 → 광역/도만
-  """
   s = (title_or_address or "").strip()
   s = re.sub(rf"^{PREFIX}", "", s)
 
@@ -254,13 +250,6 @@ def extract_province_sgg(title_or_address: str, *, use_address_fallback: bool = 
   return ""
 
 def extract_city_sgg(title_or_address: str, *, use_address_fallback: bool = True) -> str:
-  """
-  출력: '시군구'만
-  - 세종은 빈 문자열
-  - 시/군/구 단독 시작 → 해당 시군구 시퀀스
-  - 광역/도 + 원시도시 + 동/읍/면 → 원시도시
-  - 광역/도 + 동/읍/면 → 빈 문자열
-  """
   s = (title_or_address or "").strip()
   s = re.sub(rf"^{PREFIX}", "", s)
 
@@ -312,7 +301,7 @@ def extract_city_sgg(title_or_address: str, *, use_address_fallback: bool = True
   return ""
 
 # ─────────────────────────────────────────────────────────────
-# 3) 건물명 추출
+# 3) 건물명 추출 (행정구역 토큰 제외)
 _BUILDING_STOP = re.compile(
   r"(?:일괄매각|개별매각|매각\s*공고|매각공고|재공매|재매각|후\s*개별수의계약\s*공고)"
 )
@@ -322,7 +311,6 @@ _UNIT_TOKENS = re.compile(
 _BRACKET = re.compile(r"[\[\(].*?[\]\)]")
 _SEPARATORS = re.compile(r"[,\u00B7·/]|(?:\s+외\s+)")
 
-# 건물명 접미사 힌트
 _BUILDING_SUFFIX = (
   r"(?:타워|팰리스|캐슬|캐슬플러스|팰리움|밸리|스퀘어|시티|힐스|힐스테이트|"
   r"아이파크|자이|더힐|프라자|프라임|스카이|에버빌|해링턴타워|해링턴|아파트|"
@@ -331,12 +319,11 @@ _BUILDING_SUFFIX = (
 _BUILDING_CORE = r"[가-힣A-Za-z0-9\-·]+"
 _BUILDING_CANDIDATE = re.compile(rf"({_BUILDING_CORE}(?:{_BUILDING_SUFFIX})?)")
 
-# 건물명에서 제외할 패턴: 순수 지번/수량 단위
 _EXCLUDE_BUILDING = re.compile(
-  r"""^
+  rf"""^
     (?:외\s*\d+\s*)?
     (?:
-      (?:[가-힣]-\d+|\d+)(?:-\d+)?(?:번지)?
+      (?:[가-힣]{HYP}\d+|\d+)(?:{HYP}\d+)?(?:번지)?
       |
       \d+\s*개(?:\s*(?:호|호실|세대|필지))?
       |
@@ -345,11 +332,28 @@ _EXCLUDE_BUILDING = re.compile(
   """, re.X
 )
 
+_ADMIN_SUFFIX = re.compile(r"(?:광역시|특별시|특별자치시|특별자치도|도|시|군|구)$")
+_ADMIN_FULL = re.compile(
+  r"^(?:서울특별시|서울시|서울|부산광역시|부산시|부산|대구광역시|대구시|대구|"
+  r"인천광역시|인천시|인천|광주광역시|광주시|광주|대전광역시|대전시|대전|"
+  r"울산광역시|울산시|울산|경기도|경기|강원특별자치도|강원도|강원|충청북도|충북|"
+  r"충청남도|충남|전북특별자치도|전라북도|전북|전라남도|전남|경상북도|경북|"
+  r"경상남도|경남|제주특별자치도|제주도|제주|세종특별자치시|세종시|세종)$"
+)
+
 def extract_building_name(title: str) -> str:
   s = (title or "").strip()
-  addr = extract_address(s)
-  tail = s[len(addr):].strip() if addr and s.startswith(addr) else s
+  s = re.sub(rf"^{PREFIX}", "", s)  # 태그 제거
 
+  # 주소 제거: 문장 내 첫 발생 지점을 기준으로 tail 산출
+  addr = extract_address(s)
+  if addr:
+    i = s.find(addr)
+    tail = s[i + len(addr):].strip() if i >= 0 else s
+  else:
+    tail = s
+
+  # 괄호/동·층·호/공고 키워드 제거
   tail = _BRACKET.sub(" ", tail)
   tail = _UNIT_TOKENS.sub(" ", tail)
   mstop = _BUILDING_STOP.search(tail)
@@ -358,6 +362,9 @@ def extract_building_name(title: str) -> str:
 
   parts = [p.strip() for p in _SEPARATORS.split(tail) if p.strip()]
   best = ""
+
+  def _is_admin_token(tok: str) -> bool:
+    return bool(_ADMIN_FULL.match(tok) or _ADMIN_SUFFIX.search(tok))
 
   def score(x: str) -> tuple:
     suf = x.endswith((
@@ -368,15 +375,16 @@ def extract_building_name(title: str) -> str:
     return (1 if suf else 0, len(x))
 
   for p in parts:
-    cands = []
     for mm in _BUILDING_CANDIDATE.finditer(p):
       token = mm.group(1).strip("-·").strip()
-      if len(token) >= 3 and not _EXCLUDE_BUILDING.match(token):
-        cands.append(token)
-    if cands:
-      pick = sorted(cands, key=score, reverse=True)[0]
-      if score(pick) > score(best):
-        best = pick
+      if len(token) < 2:
+        continue
+      if _EXCLUDE_BUILDING.match(token):
+        continue
+      if _is_admin_token(token):
+        continue
+      if not best or score(token) > score(best):
+        best = token
   return best
 
 # ─────────────────────────────────────────────────────────────
@@ -384,13 +392,16 @@ def extract_building_name(title: str) -> str:
 _SALE_KEYWORDS = re.compile(r"(?:일괄매각|개별매각|매각\s*공고|매각공고|재공매|재매각)")
 def extract_sale_content(title: str) -> str:
   s = (title or "").strip()
+  s = re.sub(rf"^{PREFIX}", "", s)  # 태그 제거
 
-  # 1) 주소 제거
+  # 1) 주소 제거 (첫 발생 위치 기준)
   addr = extract_address(s)
   if addr:
-    s = s.replace(addr, "", 1).strip()
+    i = s.find(addr)
+    if i >= 0:
+      s = (s[:i] + s[i + len(addr):]).strip()
 
-  # 2) '광역/도 + 시군구' 또는 '시/군/구 시퀀스' 제거(남아있을 수 있는 앞부분 방지)
+  # 2) 도시명(광역/도 + 시군구 또는 시/군/구 시퀀스) 제거(앞부분에 남았을 경우)
   prov_sgg = extract_province_sgg(title, use_address_fallback=True)
   if prov_sgg:
     s = s.replace(prov_sgg, "", 1).strip()
@@ -400,7 +411,7 @@ def extract_sale_content(title: str) -> str:
   if bld:
     s = s.replace(bld, "", 1).strip()
 
-  # 4) 선두 '외 N...' → 'N...' 로 정리 (N개호실/필지 등)
+  # 4) 선두 '외 N...' → 'N...' 로 정리
   s = re.sub(r"^외\s*(\d+)\s*", r"\1", s)
 
   # 5) 공백/구두점 정리
