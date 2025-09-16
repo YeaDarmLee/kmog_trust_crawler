@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
-# address_only_regex.py (v8)
-# - 세종특별자치시 특수 처리: 시/군/구 없이도 매칭
+# address_only_regex.py (v9)
+# - 세종특별자치시 특수 처리(시/군/구 없이도 매칭)
 # - 전북특별자치도/강원특별자치도 대응 및 표준화
-# - 광역시/도 약칭(예: '인천', '부산') 대응
+# - 광역시/도 약칭(예: '인천', '부산', '경기', '충남' 등) 대응
 # - 주소에 '...지구/...구역' 포함
 # - 건물명에서 순수 지번/수량 토큰 제외
-# - 🔧 보강: '시/구 단독 시작' 패턴 지원 (예: '서초구 서초동 1445', '부산 덕천동 397-1', '마산시 합성동 125-5')
+# - 시/군/구 단독 시작(예: '서초구 서초동 1445') 대응
+# - 🔧 보강:
+#    1) 광역/도 + (시/군/구 '접미사 생략') + 동/읍/면 (예: '경기 파주 야당동', '강원 양양 거마리')
+#    2) 광역/도 + 동/읍/면 직결 (예: '인천 만수동', '충북 장락동', '제주특별자치도 한림읍')
+#    3) '홍성 오관리'처럼 시/군 접미사가 생략된 원시 도시명(raw city) 허용
 
 import re
 
@@ -44,6 +48,9 @@ REG1 = rf"(?:{PROV_SEJONG}|{REG1_NO_SEJONG})"
 # 시/군/구 — 뒤에 공백/끝 경계 요구(강구면이 '강구'로 잘리는 문제 방지)
 CITY_GUN_GU = r"(?:[가-힣]+(?:시|군|구))(?=\s|$)"
 
+# ⚠️ 접미사 없는 '원시 도시명' (예: 파주, 포천, 양양, 홍성 등)
+RAW_CITY = r"(?:[가-힣]{2,})"
+
 # 읍/면/동/가/리
 TOWN = r"(?:[가-힣0-9]+(?:읍|면|동|가|리))"
 
@@ -58,7 +65,7 @@ LOT_LIST = rf"{LOT}(?:\s*,\s*\d+(?:-\d+)?)*"
 PLAN_DIST = r"(?:[가-힣0-9]+(?:지구|구역))"
 
 # ─────────────────────────────────────────────────────────────
-# 1) 전체 주소만 추출 — 세종 분기 + 일반 분기 + (약칭 시/구 단독)
+# 1) 전체 주소만 추출 — 복수 분기(세종/일반/시군구 단독/보강 패턴들)
 PATTERN = rf"""
 ^(?P<addr>
   {PREFIX}
@@ -80,7 +87,7 @@ PATTERN = rf"""
   (?:\s*{LOT_LIST})?
 
   |
-  # ◇ 보조: 시/군/구 단독 시작 (예: '서초구 서초동 1445', '마산시 합성동 125-5', '인천 삼산동')
+  # ◇ 보조1: 시/군/구 단독 시작 (예: '서초구 서초동 1445', '마산시 합성동 125-5')
   (?P<sgg_only>{CITY_GUN_GU})
   (?:\s+{TOWN}){{0,3}}
   (?:\s+{PLAN_DIST})?
@@ -94,7 +101,7 @@ RX_ADDR = re.compile(PATTERN, re.X)
 def extract_address(title: str) -> str:
   """
   제목에서 '행정구역~지번/지구/구역'까지의 '주소만' 추출.
-  - 세종 특수/일반(광역+시군구)/시군구 단독 시작 모두 처리
+  - 세종 특수/일반(광역+시군구)/시군구 단독 시작/광역+원시도시+동/광역+동 모두 처리
   """
   m = RX_ADDR.search(title or "")
   if not m:
@@ -102,7 +109,8 @@ def extract_address(title: str) -> str:
   return re.sub(r"^\d+\.\s*", "", m.group("addr")).strip()
 
 # ─────────────────────────────────────────────────────────────
-# 2) 시군구(도시명): "광역/도 + 시군구" (세종은 광역만)
+# 2) 시군구(도시명)
+#   기본: "광역/도 + 시군구" (세종은 광역만)
 PATTERN_SGG = rf"""
 ^{PREFIX}
 (?P<prov>{REG1_NO_SEJONG})
@@ -114,7 +122,7 @@ RX_SGG = re.compile(PATTERN_SGG, re.X)
 # 세종 전용: 시/군/구 없이도 OK
 RX_SGJ = re.compile(rf"^{PREFIX}(?P<prov>{PROV_SEJONG})\b")
 
-# 시/군/구 단독 시작 (예: '서초구', '마산시 합성동', '부산 북구' 등)
+# 시/군/구 단독 시작 (예: '서초구', '마산시 합성동' 등)
 PATTERN_SGG_ONLY = rf"""
 ^{PREFIX}
 (?P<sgg1>{CITY_GUN_GU})
@@ -122,9 +130,26 @@ PATTERN_SGG_ONLY = rf"""
 """
 RX_SGG_ONLY = re.compile(PATTERN_SGG_ONLY, re.X)
 
+# 광역/도 + '원시 도시명'(접미사 없음) + 동/읍/면
+PATTERN_PROV_RAWCITY = rf"""
+^{PREFIX}
+(?P<prov_raw2>{REG1_NO_SEJONG})
+\s+(?P<rawcity2>{RAW_CITY})
+\s+{TOWN}
+"""
+RX_PROV_RAWCITY = re.compile(PATTERN_PROV_RAWCITY, re.X)
+
+# 광역/도 + 동/읍/면 직결
+PATTERN_PROV_TOWN = rf"""
+^{PREFIX}
+(?P<prov_town2>{REG1_NO_SEJONG})
+\s+{TOWN}
+"""
+RX_PROV_TOWN = re.compile(PATTERN_PROV_TOWN, re.X)
+
 # 표준화 매핑 — 약칭 → 정식 명칭(최근 행정명칭 기준)
 _PROV_STD = {
-  # 광역시: 시/약칭 → 공식
+  # 광역시/도 약칭 → 공식
   "서울": "서울특별시", "서울시": "서울특별시",
   "부산": "부산광역시", "부산시": "부산광역시",
   "대구": "대구광역시", "대구시": "대구광역시",
@@ -132,8 +157,6 @@ _PROV_STD = {
   "광주": "광주광역시", "광주시": "광주광역시",
   "대전": "대전광역시", "대전시": "대전광역시",
   "울산": "울산광역시", "울산시": "울산광역시",
-
-  # 도: 약칭/옛 명칭 → 최신 공식
   "경기": "경기도",
   "강원": "강원특별자치도", "강원도": "강원특별자치도",
   "충북": "충청북도",
@@ -143,7 +166,6 @@ _PROV_STD = {
   "경북": "경상북도",
   "경남": "경상남도",
   "제주": "제주특별자치도", "제주도": "제주특별자치도",
-
   # 세종
   "세종": "세종특별자치시", "세종시": "세종특별자치시",
 }
@@ -155,87 +177,136 @@ def extract_province_sgg(title_or_address: str, *, use_address_fallback: bool = 
   """
   출력: '광역/도 + 시군구'
   - 세종은 '세종특별자치시'만 반환(시/군/구 자체가 없음)
-  - 광역/도 없이 '시/군/구'만 시작하는 케이스는 '시군구(시퀀스)'만 반환
-    예) '서초구 서초동 ...' → '서초구'
-        '마산시 합성동 ...' → '마산시 합성동' (연속 시군구 2개까지)
+  - 광역/도 + 원시도시 + 동/읍/면 → '광역/도 + 원시도시' 반환 (예: '경기도 파주')
+  - 광역/도 + 동/읍/면 → 광역/도만 반환 (예: '인천광역시')
+  - 시/군/구 단독 시작 → '시군구 시퀀스'만 반환 (예: '서초구', '마산시 합성동')
   """
   s = (title_or_address or "").strip()
   s = re.sub(r"^\d+\.\s*", "", s)
 
+  # 1) 정규 '광역/도 + 시군구'
   m = RX_SGG.search(s)
-  if not m:
-    # 세종 특수 케이스
-    m2 = RX_SGJ.search(s)
-    if not m2 and use_address_fallback:
-      addr = extract_address(s)
-      if addr:
-        m = RX_SGG.search(addr)
-        if not m:
-          m2 = RX_SGJ.search(addr)
-    if m2:
-      prov = _normalize_province(m2.group("prov"))
-      return prov  # 세종: 광역만
+  if m:
+    prov = _normalize_province(m.group("prov") or "")
+    sgg1 = m.group("sgg1") or ""
+    sgg2 = m.group("sgg2") or ""
+    return f"{prov} {sgg1}{(' ' + sgg2) if sgg2 else ''}".strip()
 
-    # 시/군/구 단독 시작 케이스 처리
-    m3 = RX_SGG_ONLY.search(s)
-    if not m3 and use_address_fallback:
-      addr = extract_address(s)
-      if addr:
-        m3 = RX_SGG_ONLY.search(addr)
-    if m3:
-      sgg1 = (m3.group("sgg1") or "").strip()
-      sgg2 = (m3.group("sgg2") or "").strip()
-      return f"{sgg1}{(' ' + sgg2) if sgg2 else ''}".strip()
+  # 2) 세종 특수
+  m2 = RX_SGJ.search(s)
+  if not m2 and use_address_fallback:
+    addr = extract_address(s)
+    if addr:
+      m = RX_SGG.search(addr)
+      if m:
+        prov = _normalize_province(m.group("prov") or "")
+        sgg1 = m.group("sgg1") or ""
+        sgg2 = m.group("sgg2") or ""
+        return f"{prov} {sgg1}{(' ' + sgg2) if sgg2 else ''}".strip()
+      m2 = RX_SGJ.search(addr)
+  if m2:
+    prov = _normalize_province(m2.group("prov"))
+    return prov  # 세종: 광역만
 
-    if not m:
-      return ""
+  # 3) 시/군/구 단독 시작
+  m3 = RX_SGG_ONLY.search(s)
+  if not m3 and use_address_fallback:
+    addr = extract_address(s)
+    if addr:
+      m3 = RX_SGG_ONLY.search(addr)
+  if m3:
+    sgg1 = (m3.group("sgg1") or "").strip()
+    sgg2 = (m3.group("sgg2") or "").strip()
+    return f"{sgg1}{(' ' + sgg2) if sgg2 else ''}".strip()
 
-  prov = _normalize_province(m.group("prov") or "")
-  sgg1 = m.group("sgg1") or ""
-  sgg2 = m.group("sgg2") or ""
-  return f"{prov} {sgg1}{(' ' + sgg2) if sgg2 else ''}".strip()
+  # 4) 광역/도 + 원시도시 + 동/읍/면
+  m4 = RX_PROV_RAWCITY.search(s)
+  if not m4 and use_address_fallback:
+    addr = extract_address(s)
+    if addr:
+      m4 = RX_PROV_RAWCITY.search(addr)
+  if m4:
+    prov = _normalize_province(m4.group("prov_raw2") or "")
+    rawc = (m4.group("rawcity2") or "").strip()
+    return f"{prov} {rawc}".strip()
+
+  # 5) 광역/도 + 동/읍/면 직결 → 광역/도만
+  m5 = RX_PROV_TOWN.search(s)
+  if not m5 and use_address_fallback:
+    addr = extract_address(s)
+    if addr:
+      m5 = RX_PROV_TOWN.search(addr)
+  if m5:
+    prov = _normalize_province(m5.group("prov_town2") or "")
+    return prov
+
+  return ""
 
 def extract_city_sgg(title_or_address: str, *, use_address_fallback: bool = True) -> str:
   """
   출력: '시군구'만
   - 세종은 시/군/구가 없으므로 빈 문자열 반환
   - 시/군/구 단독 시작 케이스는 해당 시군구 시퀀스 반환
+  - 광역/도 + 원시도시 + 동/읍/면 → 원시도시 반환
+  - 광역/도 + 동/읍/면 → 빈 문자열
   """
   s = (title_or_address or "").strip()
   s = re.sub(r"^\d+\.\s*", "", s)
 
+  # 1) 정규 '광역/도 + 시군구'
   m = RX_SGG.search(s)
-  if not m:
-    m2 = RX_SGJ.search(s)
-    if not m2 and use_address_fallback:
-      addr = extract_address(s)
-      if addr:
-        m = RX_SGG.search(addr)
-        if not m:
-          m2 = RX_SGJ.search(addr)
-    if m2 and not m:
-      return ""  # 세종: 시군구 없음
+  if m:
+    sgg1 = m.group("sgg1") or ""
+    sgg2 = m.group("sgg2") or ""
+    return (sgg1 + (" " + sgg2 if sgg2 else "")).strip()
 
-    # 시/군/구 단독 시작 케이스
-    m3 = RX_SGG_ONLY.search(s)
-    if not m3 and use_address_fallback:
-      addr = extract_address(s)
-      if addr:
-        m3 = RX_SGG_ONLY.search(addr)
-    if m3:
-      sgg1 = (m3.group("sgg1") or "").strip()
-      sgg2 = (m3.group("sgg2") or "").strip()
-      return (sgg1 + (" " + sgg2 if sgg2 else "")).strip()
+  # 2) 세종 특수 → 없음
+  m2 = RX_SGJ.search(s)
+  if not m2 and use_address_fallback:
+    addr = extract_address(s)
+    if addr:
+      m = RX_SGG.search(addr)
+      if m:
+        sgg1 = m.group("sgg1") or ""
+        sgg2 = m.group("sgg2") or ""
+        return (sgg1 + (" " + sgg2 if sgg2 else "")).strip()
+      m2 = RX_SGJ.search(addr)
+  if m2:
+    return ""
 
-    if not m:
-      return ""
+  # 3) 시/군/구 단독 시작
+  m3 = RX_SGG_ONLY.search(s)
+  if not m3 and use_address_fallback:
+    addr = extract_address(s)
+    if addr:
+      m3 = RX_SGG_ONLY.search(addr)
+  if m3:
+    sgg1 = (m3.group("sgg1") or "").strip()
+    sgg2 = (m3.group("sgg2") or "").strip()
+    return (sgg1 + (" " + sgg2 if sgg2 else "")).strip()
 
-  sgg1 = m.group("sgg1") or ""
-  sgg2 = m.group("sgg2") or ""
-  return (sgg1 + (" " + sgg2 if sgg2 else "")).strip()
+  # 4) 광역/도 + 원시도시 + 동/읍/면 → 원시도시만
+  m4 = RX_PROV_RAWCITY.search(s)
+  if not m4 and use_address_fallback:
+    addr = extract_address(s)
+    if addr:
+      m4 = RX_PROV_RAWCITY.search(addr)
+  if m4:
+    return (m4.group("rawcity2") or "").strip()
+
+  # 5) 광역/도 + 동/읍/면 직결 → 없음
+  m5 = RX_PROV_TOWN.search(s)
+  if not m5 and use_address_fallback:
+    addr = extract_address(s)
+    if addr:
+      m5 = RX_PROV_TOWN.search(addr)
+  if m5:
+    return ""
+
+  return ""
 
 # ─────────────────────────────────────────────────────────────
-# 3) 건물명 추출: 동/층/호·공고키워드 제거 후, '지번/수량' 토큰 제외
+# 3) 건물명 추출
 _BUILDING_STOP = re.compile(
   r"(?:일괄매각|개별매각|매각\s*공고|매각공고|재공매|재매각|후\s*개별수의계약\s*공고)"
 )
@@ -315,7 +386,7 @@ def extract_sale_content(title: str) -> str:
   if addr:
     s = s.replace(addr, "", 1).strip()
 
-  # 2) 광역/도 + 시군구 제거 (세종은 광역만 / 시군구 단독도 제거)
+  # 2) 광역/도 + 시군구/원시도시 제거 (세종은 광역만)
   prov_sgg = extract_province_sgg(title, use_address_fallback=True)
   if prov_sgg:
     s = s.replace(prov_sgg, "", 1).strip()
