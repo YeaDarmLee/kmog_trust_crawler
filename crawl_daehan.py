@@ -76,7 +76,7 @@ def _col_letter(n: int) -> str:
 def setup_logging():
   os.makedirs("logs", exist_ok=True)
   ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-  logfile = f"logs/reitpia_sheets_{ts}.log"
+  logfile = f"logs/daehan_sheets_{ts}.log"
   logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
