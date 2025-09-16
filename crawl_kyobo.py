@@ -1,12 +1,10 @@
-# crawl_kyobotrust_to_sheets.py
 # -*- coding: utf-8 -*-
+# crawl_kyobo.py
 # 교보자산신탁 공매정보(BBS_0005) → Google Sheets append
-# - 리스트 구조: .boardList (a.row 내부에 number/narw/link/narw)
-# - 주소 기준 중복은 "2건 이상일 때만" 부여(= 1건이면 빈칸 유지)
-#   · append 시 두 번째부터 임시로 '중복2..N' 부여
-#   · append 직후 정규화하여 첫 건을 '중복1'로 보정(2건 이상 그룹만)
-# - resume: output/.kyobo_state.json (마지막 페이지, seen_urls)
-# - address_only_regex.py(동일 디렉토리) 사용
+# - 주소 중복 규칙: 같은 주소가 2건 이상일 때만 '중복1..N' (1건은 공란)
+# - append 직전엔 두 번째부터 임시 '중복2..N' → append 직후 전체 정규화로 '중복1..N' 보정
+# - 재시작해도 시트/상태파일로 seen_urls / address_counts 복원
+# - STEP=1(과거→현재)일 때는 페이지 내 item을 역순 처리해 전체 오름차순 보장
 
 import os, re, time, json, logging
 from datetime import datetime
@@ -28,17 +26,15 @@ from address_only_regex import (
 )
 
 # ────────── Google Sheets 설정 ──────────
-SPREADSHEET_ID   = "1BEoi3Q6pOoUBUcEDgdy1YF03Ehc1hY02KfKz31GMt7E"  # 동일 스프레드시트 사용
+SPREADSHEET_ID   = "1BEoi3Q6pOoUBUcEDgdy1YF03Ehc1hY02KfKz31GMt7E"
 WORKSHEET_NAME   = "교보자산_신탁"
 SERVICE_KEY_FILE = "service_account.json"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# 헤더/append 순서 일치(무궁화 포맷과 동일)
 HEADER = [
-  "번호",
-  "신탁사명", "게시글 제목", "게시일",
-  "주소 (지번)", "도시명", "건물명", "매각내용",
-  "용도", "중복여부",  "원문 링크(URL)",
+  "번호","신탁사명","게시글 제목","게시일",
+  "주소 (지번)","도시명","건물명","매각내용","용도",
+  "중복여부","원문 링크(URL)"
 ]
 
 # ────────── 크롤링 설정 ──────────
@@ -52,13 +48,32 @@ NTT_RE  = re.compile(r"fnViewArticle\('(\d+)'\s*,\s*'BBS_0005'\)")
 
 DELAY_SEC = 1.0
 
-# 페이지 범위(검수 시 조절)
-START_PAGE = 1
-END_PAGE   = 587
-STEP       = 1
+# 기본: 현재→과거
+START_PAGE = 587
+END_PAGE   = 1
+STEP       = -1
 
 RESUME = True
 STATE_FILE = "output/.kyobo_state.json"
+
+# ────────── 헤더/컬럼 유틸 ──────────
+ADDRESS_COL_CANDIDATES  = ["address", "주소 (지번)", "주소", "Address"]
+DUP_COL_CANDIDATES      = ["duplicate", "중복여부", "중복", "Duplicate"]
+URL_COL_CANDIDATES      = ["url", "원문 링크(URL)", "링크", "URL"]
+
+def _find_col_index(header: list, candidates: list) -> int:
+  name_to_idx = {name: i for i, name in enumerate(header)}
+  for c in candidates:
+    if c in name_to_idx:
+      return name_to_idx[c]
+  return -1
+
+def _col_letter(n: int) -> str:
+  s = ""
+  while n:
+    n, r = divmod(n - 1, 26)
+    s = chr(r + 65) + s
+  return s
 
 # ────────── 로깅/세션 ──────────
 def setup_logging():
@@ -95,26 +110,6 @@ def make_session() -> requests.Session:
   s.mount("https://", adapter)
   return s
 
-# ────────── 헤더/컬럼 유연 매칭 유틸 ──────────
-ADDRESS_COL_CANDIDATES  = ["address", "주소 (지번)", "주소", "Address"]
-DUP_COL_CANDIDATES      = ["duplicate", "중복여부", "중복", "Duplicate"]
-URL_COL_CANDIDATES      = ["url", "원문 링크(URL)", "링크", "URL"]
-
-def _find_col_index(header: list, candidates: list) -> int:
-  """header 리스트에서 candidates 중 먼저 매칭되는 컬럼의 인덱스(0-based) 반환. 없으면 -1"""
-  name_to_idx = {name: i for i, name in enumerate(header)}
-  for c in candidates:
-    if c in name_to_idx:
-      return name_to_idx[c]
-  return -1
-
-def _col_letter(n: int) -> str:
-  s = ""
-  while n:
-    n, r = divmod(n - 1, 26)
-    s = chr(r + 65) + s
-  return s
-
 # ────────── 시트 유틸 ──────────
 def _open_sheet():
   creds = Credentials.from_service_account_file(SERVICE_KEY_FILE, scopes=SCOPES)
@@ -135,9 +130,8 @@ def _open_sheet():
 
 def _normalize_duplicate_numbering(ws):
   """
-  시트 전체를 훑어서,
-  - 같은 주소가 2건 이상인 그룹만 '중복1..N'로 채움
-  - 1건뿐인 주소는 duplicate 공란 유지
+  같은 주소가 2건 이상인 그룹만 '중복1..N'로 채우고,
+  1건뿐인 주소는 공란 유지.
   """
   values = ws.get_all_values()
   if not values:
@@ -154,7 +148,6 @@ def _normalize_duplicate_numbering(ws):
     addr = (row[addr_idx].strip() if addr_idx < len(row) else "")
     groups.setdefault(addr, []).append(r)
 
-  # 업데이트할 중복열 구성(헤더행 + 데이터행 수 유지)
   dup_col = [header[dup_idx]] + [""] * (len(values) - 1)
   for addr, rows in groups.items():
     if not addr:
@@ -162,7 +155,6 @@ def _normalize_duplicate_numbering(ws):
     if len(rows) >= 2:
       for k, r in enumerate(rows, start=1):
         dup_col[r - 1] = f"중복{k}"
-    # 1건뿐이면 공란 유지
 
   col_letter = _col_letter(dup_idx + 1)
   ws.update(f"{col_letter}1:{col_letter}{len(dup_col)}",
@@ -196,7 +188,6 @@ def _load_existing_from_sheet(ws) -> Tuple[set, Dict[str, int]]:
 def _append_rows(ws, rows: List[Dict[str, str]]):
   if not rows:
     return
-  # 기본은 HEADER 순서로 append (시트 헤더가 달라도 컬럼 이름 유연 매칭으로 동작)
   values = []
   for r in rows:
     values.append([
@@ -230,6 +221,7 @@ def _save_state(state: Dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
       json.dump(state, f, ensure_ascii=False)
   except Exception:
+  # 상태 저장 실패는 치명적이지 않음
     pass
 
 # ────────── 보조 파서 ──────────
@@ -254,20 +246,8 @@ def _extract_row_number_from_text(t: str) -> str:
 def _make_purpose(title: str) -> str:
   return "오피스텔" if "오피스텔" in (title or "") else ""
 
-# ────────── 리스트 파서(.boardList 전용) ──────────
+# ────────── 리스트 파서 ──────────
 def parse_list_page(html: str) -> List[Dict[str, str]]:
-  """
-  <div class="boardList">
-    <div class="body">
-      <a class="row" onclick="fnViewArticle('1268','BBS_0005');">
-        <div class="number">9</div>
-        <div class="narw">종료</div>
-        <div class="link">제목</div>
-        <div class="narw">2006.10.31</div>
-      </a>
-    </div>
-  </div>
-  """
   soup = BeautifulSoup(html, "lxml")
   items: List[Dict[str, str]] = []
 
@@ -283,7 +263,6 @@ def parse_list_page(html: str) -> List[Dict[str, str]]:
 
     no = _extract_row_number_from_text(no_el.get_text(strip=True) if no_el else "")
     title = link_el.get_text(" ", strip=True) if link_el else ""
-    # narw 2개: [진행상황, 등록일]
     post_date = _normalize_date(narw_els[-1].get_text(strip=True) if narw_els else "")
 
     address = extract_address(title) or ""
@@ -303,92 +282,89 @@ def parse_list_page(html: str) -> List[Dict[str, str]]:
       "building": building,
       "sale_content": sale_content,
       "purpose": purpose,
-      # duplicate은 append 직전에 주소별 카운트로 채움
     })
-
+    
   return items
-
-# ────────── 크롤링 루프 ──────────
-def crawl_all(ws, start_page: int, end_page: int, step: int, seen_urls: set, address_counts: Dict[str, int]):
-  sess = make_session()
-  state = _load_state()
-  last_done = state.get("last_done_page")
-  if RESUME and last_done is not None:
-    start_page = last_done + (1 if step > 0 else -1)
-
-  logging.info("크롤 범위: %s → %s (step=%s)", start_page, end_page, step)
-
-  for page in range(start_page, end_page + (1 if step > 0 else -1), step):
-    params = {"bbsId": BBS_ID, "pageIndex": page}
-    url = urljoin(BASE, LIST_PATH)
-    try:
-      r = sess.get(url, params=params, timeout=15)
-      if r.status_code != 200:
-        logging.warning("[LIST] page=%s status=%s", page, r.status_code)
-        time.sleep(DELAY_SEC)
-        continue
-      if not r.encoding or r.encoding.lower() in ("iso-8859-1", "ascii"):
-        r.encoding = r.apparent_encoding or "utf-8"
-      html = r.text
-    except requests.RequestException as e:
-      logging.error("[LIST] page=%s error=%s", page, e)
-      time.sleep(DELAY_SEC)
-      continue
-
-    items = parse_list_page(html)
-
-    # 중복 URL 제외 + duplicate(번호) 표기 + 배치 append
-    batch: List[Dict[str, str]] = []
-    for it in items:
-      url = it["url"]
-      if url in seen_urls:
-        continue
-      addr = (it.get("address") or "").strip()
-      duplicate = ""
-      if addr:
-        prev = address_counts.get(addr, 0)
-        # 첫 등장(0) → 공란 유지, 두 번째부터 '중복2..N' 임시 부여
-        if prev >= 1:
-          duplicate = f"중복{prev + 1}"
-        address_counts[addr] = prev + 1
-      it["duplicate"] = duplicate
-      batch.append(it)
-      seen_urls.add(url)
-
-    if batch:
-      _append_rows(ws, batch)
-      logging.info("[LIST] page=%s appended rows=%d", page, len(batch))
-      # 새로 들어온 행까지 포함해 '2건 이상' 그룹에만 '중복1..N' 재부여
-      _normalize_duplicate_numbering(ws)
-
-    # 상태 저장
-    state["last_done_page"] = page
-    state["seen_urls"] = list(seen_urls)
-    _save_state(state)
-
-    time.sleep(DELAY_SEC)
 
 # ────────── 메인 ──────────
 def main():
   setup_logging()
   ws = _open_sheet()
 
-  # 1) 기존 시트의 duplicate 열 정규화(2건 이상만 '중복1..N', 1건은 공란)
+  # 1) 기존 시트의 중복열 정규화(2건 이상만 '중복1..N', 1건은 공란)
   _normalize_duplicate_numbering(ws)
 
-  # 2) 정규화된 결과를 기반으로 현재까지의 seen_urls / address_counts 로드
-  seen_urls, address_counts = _load_existing_from_sheet(ws)
+  # 2) 시트/상태 기반으로 seen_urls / address_counts 복원
+  seen_urls_sheet, address_counts = _load_existing_from_sheet(ws)
+  state = _load_state()
+  seen_urls = set(seen_urls_sheet) | set(state.get("seen_urls") or [])
+  last_done = state.get("last_done_page")
 
-  # 3) 수집 실행
-  crawl_all(
-    ws=ws,
-    start_page=START_PAGE,
-    end_page=END_PAGE,
-    step=STEP,
-    seen_urls=set(seen_urls),
-    address_counts=address_counts,
-  )
-  logging.info("수집 종료")
+  # 3) 재개 지점 계산
+  start_page = START_PAGE
+  if RESUME and last_done is not None:
+    start_page = last_done + (1 if STEP > 0 else -1)
+
+  logging.info("크롤 범위: %s → %s (step=%s)", start_page, END_PAGE, STEP)
+  session = make_session()
+
+  try:
+    rng_end_inclusive = END_PAGE + (1 if STEP > 0 else -1)
+    for page in range(start_page, rng_end_inclusive, STEP):
+      params = {"bbsId": BBS_ID, "pageIndex": page}
+      url = urljoin(BASE, LIST_PATH)
+
+      try:
+        r = session.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+          logging.warning("[LIST] page=%s status=%s", page, r.status_code)
+          time.sleep(DELAY_SEC)
+          continue
+        if not r.encoding or r.encoding.lower() in ("iso-8859-1", "ascii"):
+          r.encoding = r.apparent_encoding or "utf-8"
+        html = r.text
+      except requests.RequestException as e:
+        logging.error("[LIST] page=%s error=%s", page, e)
+        time.sleep(DELAY_SEC)
+        continue
+
+      items = parse_list_page(html)
+      items = list(reversed(items))
+
+      # 중복 URL 제외 + 임시 duplicate('중복2..N') + 배치 append
+      batch: List[Dict[str, str]] = []
+      for it in items:
+        url = it["url"]
+        if url in seen_urls:
+          continue
+
+        addr = (it.get("address") or "").strip()
+        duplicate = ""
+        if addr:
+          prev = address_counts.get(addr, 0)
+          if prev >= 1:
+            duplicate = f"중복{prev + 1}"  # 임시(첫 건은 공란)
+          address_counts[addr] = prev + 1
+
+        it["duplicate"] = duplicate
+        batch.append(it)
+        seen_urls.add(url)
+
+      if batch:
+        _append_rows(ws, batch)
+        # append 후 전체 정규화 → 해당 주소 그룹만 '중복1..N' 보정(1건은 공란 유지)
+        _normalize_duplicate_numbering(ws)
+        logging.info("[LIST] page=%s appended rows=%d", page, len(batch))
+
+      # 상태 저장
+      state["last_done_page"] = page
+      state["seen_urls"] = list(seen_urls)
+      _save_state(state)
+
+      time.sleep(DELAY_SEC)
+
+  finally:
+    logging.info("수집 종료")
 
 if __name__ == "__main__":
   main()
