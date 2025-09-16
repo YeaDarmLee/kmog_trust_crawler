@@ -251,7 +251,11 @@ def parse_list_page(html: str) -> List[Dict[str, str]]:
 
     # 번호
     num_el = a.select_one("p.num")
-    no = re.search(r"\d+", num_el.get_text(strip=True)).group(0) if num_el else ""
+    no = ""
+    if num_el:
+      text = num_el.get_text(" ", strip=True)
+      m = re.search(r"\d+", text)
+      no = m.group(0) if m else ""
 
     # 제목
     title_el = a.select_one("div.txt_t")
